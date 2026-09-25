@@ -141,7 +141,7 @@ func quantizeChannel(val uint8, px, py int, palette int, dither bool) uint8 {
 		step = 64.0
 	}
 
-	if !dither {
+	if !dither || val == 0 {
 		return lut[val]
 	}
 
@@ -160,9 +160,17 @@ func quantizeChannel(val uint8, px, py int, palette int, dither bool) uint8 {
 // QuantizeRGBWithCoord quantizes an RGB color with optional Bayer dithering anchored at (px, py).
 // For Palette216 it uses the perceptual Oklab LUT; for other palettes it quantizes per-channel in RGB.
 func QuantizeRGBWithCoord(r, g, b uint8, px, py int, palette int, dither bool) RGB {
+	if r == 0 && g == 0 && b == 0 {
+		return RGB{0, 0, 0}
+	}
 	if palette == Palette216 {
 		if dither {
-			r, g, b = clampDitherRGBFast(r, g, b, bayerOffsets216[py&3][px&3])
+			offset := bayerOffsets216[py&3][px&3]
+			if r < 16 && g < 16 && b < 16 && offset > 0 {
+				// Retain clean deep blacks without checkerboard noise
+			} else {
+				r, g, b = clampDitherRGBFast(r, g, b, offset)
+			}
 		}
 		return oklabQuantLUT[r>>3][g>>3][b>>3]
 	}
