@@ -114,3 +114,10 @@ func RenderDelta(current, prev []CellState, width, height int, threshold int) ([
 
 	return buf.Bytes(), dirtyCount
 }
+
+// EncodeMotionDelta computes block motion estimation and returns packed motion delta bytes and residual count.
+func EncodeMotionDelta(current, prev []CellState, width, height, blockSize, searchRadius, threshold int) ([]byte, int) {
+	mf := EstimateBlockMotion(current, prev, width, height, blockSize, searchRadius, threshold)
+	return mf.Encode(), len(mf.Residuals)
+}
+

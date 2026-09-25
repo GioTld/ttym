@@ -123,6 +123,9 @@ func ReadChunk(r io.Reader, dec *zstd.Decoder) (*Chunk, error) {
 			return nil, fmt.Errorf("%w: audio packet size %d exceeds limit %d",
 				ErrAudioPacketTooLarge, dataLen, MaxAudioPacketBytes)
 		}
+		if ftype == PacketTypeMotionDelta && dataLen < 13 {
+			return nil, fmt.Errorf("%w: motion delta packet smaller than header (len %d)", ErrCorruptMotionData, dataLen)
+		}
 
 		if int64(dataLen) > reader.Size()-int64(reader.Len()) && int64(dataLen) > int64(reader.Len()) {
 			return nil, fmt.Errorf("%w: frame data length %d exceeds remaining chunk buffer", ErrCorruptData, dataLen)

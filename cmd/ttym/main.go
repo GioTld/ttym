@@ -145,7 +145,9 @@ func handleValidate(args []string) {
 	}
 	defer dec.Close()
 
-	videoCount := 0
+	keyframeCount := 0
+	classicDeltaCount := 0
+	motionDeltaCount := 0
 	audioCount := 0
 	for i := uint32(0); i < hdr.ChunkCount; i++ {
 		chunk, err := ttym.ReadChunk(f, dec)
@@ -162,10 +164,22 @@ func handleValidate(args []string) {
 			os.Exit(1)
 		}
 		for _, p := range chunk.Frames {
-			if p.IsVideo() {
-				videoCount++
-			} else if p.IsAudio() {
+			switch p.Type {
+			case ttym.PacketTypeVideoKeyframe:
+				keyframeCount++
+			case ttym.PacketTypeVideoDelta:
+				classicDeltaCount++
+			case ttym.PacketTypeMotionDelta:
+				motionDeltaCount++
+				if _, err := ttym.DecodeMotionFrame(p.Data, int(hdr.Width), int(hdr.Height)); err != nil {
+					fmt.Fprintf(os.Stderr, "validation failed: chunk %d corrupt motion delta: %v\n", i, err)
+					os.Exit(1)
+				}
+			case ttym.PacketTypeAudio:
 				audioCount++
+			default:
+				fmt.Fprintf(os.Stderr, "validation failed: chunk %d unknown packet type %d\n", i, p.Type)
+				os.Exit(1)
 			}
 		}
 	}
@@ -176,6 +190,7 @@ func handleValidate(args []string) {
 		os.Exit(1)
 	}
 
-	fmt.Printf("✓ File %s is valid: %d chunks, %d video frames, %d audio packets verified.\n",
-		path, len(entries), videoCount, audioCount)
+	totalVideo := keyframeCount + classicDeltaCount + motionDeltaCount
+	fmt.Printf("✓ File %s is valid: %d chunks, %d video frames (%d keyframes, %d deltas, %d motion deltas), %d audio packets verified.\n",
+		path, len(entries), totalVideo, keyframeCount, classicDeltaCount, motionDeltaCount, audioCount)
 }

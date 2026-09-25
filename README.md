@@ -10,6 +10,7 @@
 
 - **Format Specification**: Clean binary format with fixed headers, zstd-compressed GOP chunks, and trailer seek indexes.
 - **Multiplexed Audio Tracks**: Interleaved audio packets (Raw PCM s16le, Opus, ADPCM) synchronized within GOP chunks with zero container overhead.
+- **Motion-Compensated Delta Encoding**: 2D block matching ($4\times 4$ macroblocks) and compact bitstream vectors/residuals, cutting dirty cells by $>50\%-70\%$ on camera pans and scrolling.
 - **Subpixel Block Rendering**:
   - **Half-Blocks (1×2)**: Canonical upper half-block (`▀`) sampling.
   - **Quarter-Blocks (2×2)**: 16 Unicode quadrant glyphs with 2-color k-means clustering for double horizontal resolution.
@@ -62,7 +63,7 @@ Performs full frame-by-frame and packet-by-packet integrity and decompression ch
 
 ## Usage in Go
 
-### Streaming Demuxer & Iteration
+### Streaming Demuxer & Playback Decoder
 
 ```go
 package main
@@ -85,6 +86,9 @@ func main() {
 	}
 	defer reader.Close()
 
+	hdr := reader.Header()
+	decoder := ttym.NewDecoder(int(hdr.Width), int(hdr.Height))
+
 	for {
 		packet, err := reader.NextPacket()
 		if errors.Is(err, io.EOF) {
@@ -95,7 +99,11 @@ func main() {
 		}
 
 		if packet.IsVideo() {
-			os.Stdout.Write(packet.Data)
+			ansi, err := decoder.Decode(packet)
+			if err != nil {
+				panic(err)
+			}
+			os.Stdout.Write(ansi)
 		} else if packet.IsAudio() {
 			// dispatch audio packet (PCM, Opus, ADPCM) to sound driver
 		}

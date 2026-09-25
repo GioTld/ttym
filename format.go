@@ -30,6 +30,8 @@ var (
 	ErrInvalidTrailer     = errors.New("ttym: invalid trailer index offset or bounds")
 	ErrInvalidAudioConfig = errors.New("ttym: invalid audio configuration")
 	ErrAudioPacketTooLarge = errors.New("ttym: audio packet exceeds safety limit")
+	ErrCorruptMotionData  = errors.New("ttym: corrupt motion vector or residual data")
+	ErrInvalidBlockSize   = errors.New("ttym: invalid macroblock size")
 )
 
 const (
@@ -41,6 +43,7 @@ const (
 	PacketTypeVideoKeyframe = 1
 	PacketTypeVideoDelta    = 2
 	PacketTypeAudio         = 3
+	PacketTypeMotionDelta   = 4
 
 	FrameTypeKeyframe = PacketTypeVideoKeyframe
 	FrameTypeDelta    = PacketTypeVideoDelta
@@ -63,6 +66,11 @@ const (
 	MaxSampleRate             = 192000
 	MaxChannels               = 8
 	MaxAudioPacketBytes       = 1024 * 1024 // 1 MB per audio packet
+
+	DefaultBlockSize    = 4
+	DefaultSearchRadius = 4
+	MaxBlockSize        = 16
+	MaxSearchRadius     = 16
 )
 
 // Header represents the file-level metadata of a .ttym media file.
@@ -84,16 +92,20 @@ type Header struct {
 // Packet represents a discrete media unit (video frame or audio packet) within a chunk.
 type Packet struct {
 	TimestampMs uint32
-	Type        uint8 // PacketTypeVideoKeyframe, PacketTypeVideoDelta, or PacketTypeAudio
+	Type        uint8 // PacketTypeVideoKeyframe, PacketTypeVideoDelta, PacketTypeAudio, or PacketTypeMotionDelta
 	Data        []byte
 }
 
 func (p Packet) IsVideo() bool {
-	return p.Type == PacketTypeVideoKeyframe || p.Type == PacketTypeVideoDelta
+	return p.Type == PacketTypeVideoKeyframe || p.Type == PacketTypeVideoDelta || p.Type == PacketTypeMotionDelta
 }
 
 func (p Packet) IsKeyframe() bool {
 	return p.Type == PacketTypeVideoKeyframe
+}
+
+func (p Packet) IsMotionDelta() bool {
+	return p.Type == PacketTypeMotionDelta
 }
 
 func (p Packet) IsAudio() bool {

@@ -597,4 +597,277 @@ func TestMultiplexedFileLifecycleAndSeek(t *testing.T) {
 	}
 }
 
+func TestMotionEstimationAccuracyAndDirtyReduction(t *testing.T) {
+	width, height := 80, 40
+	totalCells := width * height
+
+	frame0 := make([]CellState, totalCells)
+	frame1 := make([]CellState, totalCells)
+
+	// Create vertical stripes on frame0 with period 4
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			var fg RGB
+			if (x/2)%2 == 0 {
+				fg = RGB{255, 0, 0}
+			} else {
+				fg = RGB{0, 255, 0}
+			}
+			frame0[y*width+x] = CellState{
+				FG:   fg,
+				BG:   RGB{0, 0, 0},
+				Char: GlyphHalfBlock,
+			}
+		}
+	}
+
+	// Frame 1: shifted to the right by +2 cells
+	panX := 2
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			if x < panX {
+				// Newly revealed column entering the left edge
+				frame1[y*width+x] = CellState{
+					FG:   RGB{0, 0, 255},
+					BG:   RGB{0, 0, 0},
+					Char: GlyphHalfBlock,
+				}
+			} else {
+				// Shifted from frame 0
+				frame1[y*width+x] = frame0[y*width+(x-panX)]
+			}
+		}
+	}
+
+	// 1. Classic delta evaluation
+	_, classicDirty := RenderDelta(frame1, frame0, width, height, 0)
+
+	// 2. Motion estimation evaluation
+	mf := EstimateBlockMotion(frame1, frame0, width, height, 4, 4, 0)
+	motionResiduals := len(mf.Residuals)
+
+	if classicDirty == 0 {
+		t.Fatalf("expected non-zero classic dirty count")
+	}
+
+	// Verify dirty cell reduction target (at least 50% reduction)
+	reduction := float64(classicDirty-motionResiduals) / float64(classicDirty)
+	if reduction < 0.50 {
+		t.Errorf("dirty cell reduction %.1f%% below 50%% target (classic %d vs motion %d)",
+			reduction*100, classicDirty, motionResiduals)
+	}
+
+	// Reconstruct frame1 using Decoder
+	dec := NewDecoder(width, height)
+	if err := dec.ApplyKeyframe(frame0); err != nil {
+		t.Fatalf("ApplyKeyframe failed: %v", err)
+	}
+
+	encodedMotion := mf.Encode()
+	if err := dec.ApplyMotionDelta(encodedMotion); err != nil {
+		t.Fatalf("ApplyMotionDelta failed: %v", err)
+	}
+
+	// Canvas must match frame1 exactly cell-by-cell!
+	canvas := dec.Canvas()
+	for i := 0; i < totalCells; i++ {
+		if canvas[i].FG != frame1[i].FG || !bytes.Equal(canvas[i].Char, frame1[i].Char) {
+			t.Fatalf("reconstructed cell %d mismatch: got %+v, want %+v", i, canvas[i], frame1[i])
+		}
+	}
+}
+
+func TestMotionFrameEncodeDecodeRoundTrip(t *testing.T) {
+	mf := &MotionFrame{
+		BlockSize:  4,
+		GridWidth:  2,
+		GridHeight: 2,
+		Vectors: []MotionVector{
+			{DX: 0, DY: 0},
+			{DX: -2, DY: 1},
+			{DX: 1, DY: -2},
+			{DX: 0, DY: 0},
+		},
+		Residuals: []BlockResidual{
+			{
+				BlockIdx: 1,
+				RelX:     0,
+				RelY:     1,
+				Cell: CellState{
+					FG:   RGB{10, 20, 30},
+					BG:   RGB{40, 50, 60},
+					Char: GlyphHalfBlock,
+				},
+			},
+		},
+	}
+
+	encoded := mf.Encode()
+	decoded, err := DecodeMotionFrame(encoded, 8, 8)
+	if err != nil {
+		t.Fatalf("DecodeMotionFrame failed: %v", err)
+	}
+
+	if decoded.BlockSize != mf.BlockSize || decoded.GridWidth != mf.GridWidth || decoded.GridHeight != mf.GridHeight {
+		t.Errorf("header mismatch: %+v vs %+v", decoded, mf)
+	}
+	if len(decoded.Vectors) != len(mf.Vectors) {
+		t.Fatalf("vector count mismatch: %d vs %d", len(decoded.Vectors), len(mf.Vectors))
+	}
+	for i := range mf.Vectors {
+		if decoded.Vectors[i] != mf.Vectors[i] {
+			t.Errorf("vector %d mismatch: got %+v, want %+v", i, decoded.Vectors[i], mf.Vectors[i])
+		}
+	}
+	if len(decoded.Residuals) != len(mf.Residuals) {
+		t.Fatalf("residuals count mismatch: %d vs %d", len(decoded.Residuals), len(mf.Residuals))
+	}
+	if decoded.Residuals[0].Cell.FG != mf.Residuals[0].Cell.FG ||
+		!bytes.Equal(decoded.Residuals[0].Cell.Char, mf.Residuals[0].Cell.Char) {
+		t.Errorf("residual mismatch: got %+v, want %+v", decoded.Residuals[0], mf.Residuals[0])
+	}
+}
+
+func TestMotionCorruptionResilience(t *testing.T) {
+	// 1. Truncated header
+	if _, err := DecodeMotionFrame([]byte("MOT1"), 10, 10); !errors.Is(err, ErrCorruptMotionData) {
+		t.Errorf("expected ErrCorruptMotionData on truncated header, got %v", err)
+	}
+
+	// 2. Invalid magic
+	badMagic := make([]byte, 20)
+	copy(badMagic[0:4], "BAD!")
+	badMagic[4] = 4
+	if _, err := DecodeMotionFrame(badMagic, 8, 8); !errors.Is(err, ErrInvalidMagic) {
+		t.Errorf("expected ErrInvalidMagic, got %v", err)
+	}
+
+	// 3. Out-of-bounds motion vector
+	mf := &MotionFrame{
+		BlockSize:  4,
+		GridWidth:  2,
+		GridHeight: 2,
+		Vectors: []MotionVector{
+			{DX: 50, DY: 0}, // Points far outside width 8!
+			{DX: 0, DY: 0},
+			{DX: 0, DY: 0},
+			{DX: 0, DY: 0},
+		},
+	}
+	encoded := mf.Encode()
+	if _, err := DecodeMotionFrame(encoded, 8, 8); !errors.Is(err, ErrCorruptMotionData) {
+		t.Errorf("expected ErrCorruptMotionData on out-of-bounds vector, got %v", err)
+	}
+}
+
+func TestKeyframePackingRoundTrip(t *testing.T) {
+	cells := []CellState{
+		{FG: RGB{1, 2, 3}, BG: RGB{4, 5, 6}, Char: GlyphHalfBlock},
+		{FG: RGB{10, 20, 30}, BG: RGB{40, 50, 60}, Char: GlyphHalfBlock},
+	}
+
+	packed := PackKeyframeCells(cells, 2, 1)
+	unpacked, err := UnpackKeyframeCells(packed, 2, 1)
+	if err != nil {
+		t.Fatalf("UnpackKeyframeCells failed: %v", err)
+	}
+
+	if len(unpacked) != len(cells) {
+		t.Fatalf("cell count mismatch: %d vs %d", len(unpacked), len(cells))
+	}
+	if unpacked[0].FG != cells[0].FG || unpacked[1].BG != cells[1].BG {
+		t.Errorf("unpacked cells mismatch: %+v vs %+v", unpacked, cells)
+	}
+}
+
+func TestDecoderPlaybackWorkflow(t *testing.T) {
+	dec := NewDecoder(10, 5)
+
+	cells := make([]CellState, 50)
+	for i := range cells {
+		cells[i] = CellState{FG: RGB{255, 0, 0}, BG: RGB{0, 0, 0}, Char: GlyphHalfBlock}
+	}
+
+	// 1. Packed keyframe packet
+	kfPacket := &Packet{
+		TimestampMs: 0,
+		Type:        PacketTypeVideoKeyframe,
+		Data:        PackKeyframeCells(cells, 10, 5),
+	}
+
+	ansi, err := dec.Decode(kfPacket)
+	if err != nil {
+		t.Fatalf("Decode keyframe failed: %v", err)
+	}
+	if len(ansi) == 0 {
+		t.Errorf("expected non-empty ANSI from keyframe decode")
+	}
+
+	// 2. Motion delta packet
+	mf := EstimateBlockMotion(cells, cells, 10, 5, 4, 4, 0)
+	motionPkt := &Packet{
+		TimestampMs: 33,
+		Type:        PacketTypeMotionDelta,
+		Data:        mf.Encode(),
+	}
+
+	deltaAnsi, err := dec.Decode(motionPkt)
+	if err != nil {
+		t.Fatalf("Decode motion delta failed: %v", err)
+	}
+	// Identical frame should produce 0 dirty delta bytes
+	if len(deltaAnsi) != 0 {
+		t.Errorf("expected 0 ANSI delta bytes for identical frame, got %d", len(deltaAnsi))
+	}
+}
+
+func BenchmarkMotionEstimation(b *testing.B) {
+	width, height := 80, 40
+	totalCells := width * height
+	f0 := make([]CellState, totalCells)
+	f1 := make([]CellState, totalCells)
+
+	for i := 0; i < totalCells; i++ {
+		f0[i] = CellState{FG: RGB{uint8(i % 256), 100, 50}, BG: RGB{0, 0, 0}, Char: GlyphHalfBlock}
+		f1[i] = CellState{FG: RGB{uint8((i + 2) % 256), 100, 50}, BG: RGB{0, 0, 0}, Char: GlyphHalfBlock}
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = EstimateBlockMotion(f1, f0, width, height, 4, 4, 10)
+	}
+}
+
+func BenchmarkMotionDeltaDecoder(b *testing.B) {
+	width, height := 80, 40
+	totalCells := width * height
+	f0 := make([]CellState, totalCells)
+	f1 := make([]CellState, totalCells)
+
+	for i := 0; i < totalCells; i++ {
+		f0[i] = CellState{FG: RGB{uint8(i % 256), 100, 50}, BG: RGB{0, 0, 0}, Char: GlyphHalfBlock}
+		f1[i] = CellState{FG: RGB{uint8((i + 2) % 256), 100, 50}, BG: RGB{0, 0, 0}, Char: GlyphHalfBlock}
+	}
+
+	mf := EstimateBlockMotion(f1, f0, width, height, 4, 4, 10)
+	data := mf.Encode()
+
+	dec := NewDecoder(width, height)
+	_ = dec.ApplyKeyframe(f0)
+
+	pkt := &Packet{
+		TimestampMs: 33,
+		Type:        PacketTypeMotionDelta,
+		Data:        data,
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		_, _ = dec.Decode(pkt)
+	}
+}
+
+
 

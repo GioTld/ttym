@@ -202,6 +202,26 @@ func (w *Writer) WriteVideoDelta(timestampMs uint32, data []byte) error {
 	})
 }
 
+// WriteMotionKeyframe packs a full grid of CellStates and writes it as a keyframe packet.
+func (w *Writer) WriteMotionKeyframe(timestampMs uint32, cells []CellState) error {
+	packed := PackKeyframeCells(cells, int(w.header.Width), int(w.header.Height))
+	return w.WriteVideoKeyframe(timestampMs, packed)
+}
+
+// WriteMotionDelta writes a motion-compensated delta packet containing encoded vectors and residuals.
+func (w *Writer) WriteMotionDelta(timestampMs uint32, data []byte) error {
+	return w.WritePacket(Packet{
+		TimestampMs: timestampMs,
+		Type:        PacketTypeMotionDelta,
+		Data:        data,
+	})
+}
+
+// WriteMotionFrame encodes and writes a MotionFrame as a motion delta packet.
+func (w *Writer) WriteMotionFrame(timestampMs uint32, mf *MotionFrame) error {
+	return w.WriteMotionDelta(timestampMs, mf.Encode())
+}
+
 // WriteAudioPacket writes an interleaved audio packet.
 func (w *Writer) WriteAudioPacket(timestampMs uint32, data []byte) error {
 	return w.WritePacket(Packet{
