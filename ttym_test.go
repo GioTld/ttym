@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -252,3 +255,346 @@ func TestCodecDistanceAndDelta(t *testing.T) {
 		t.Errorf("expected cursor jump to 1;2, got %s", out)
 	}
 }
+
+func TestHeaderAudioRoundTripAndValidation(t *testing.T) {
+	// 1. Valid Opus audio header
+	opusHdr := &Header{
+		Version:         CurrentVersion,
+		ColorMode:       ColorModeTruecolor,
+		Width:           160,
+		Height:          80,
+		FPS:             30,
+		TotalFrames:     300,
+		DurationMs:      10000,
+		ChunkCount:      2,
+		AudioCodec:      AudioCodecOpus,
+		AudioChannels:   2,
+		AudioSampleRate: 48000,
+		Metadata:        "Movie With Audio",
+	}
+
+	var buf bytes.Buffer
+	if err := opusHdr.Write(&buf); err != nil {
+		t.Fatalf("opusHdr.Write failed: %v", err)
+	}
+
+	readHdr, err := ReadHeader(&buf)
+	if err != nil {
+		t.Fatalf("ReadHeader failed: %v", err)
+	}
+
+	if *readHdr != *opusHdr {
+		t.Errorf("header mismatch: got %+v, want %+v", readHdr, opusHdr)
+	}
+
+	// 2. AudioConfig validation errors
+	invalidConfigs := []Header{
+		{Width: 100, Height: 50, FPS: 24, AudioCodec: AudioCodecNone, AudioChannels: 1},
+		{Width: 100, Height: 50, FPS: 24, AudioCodec: AudioCodecNone, AudioSampleRate: 44100},
+		{Width: 100, Height: 50, FPS: 24, AudioCodec: 99, AudioChannels: 2, AudioSampleRate: 44100},
+		{Width: 100, Height: 50, FPS: 24, AudioCodec: AudioCodecPCM, AudioChannels: 0, AudioSampleRate: 44100},
+		{Width: 100, Height: 50, FPS: 24, AudioCodec: AudioCodecPCM, AudioChannels: 9, AudioSampleRate: 44100},
+		{Width: 100, Height: 50, FPS: 24, AudioCodec: AudioCodecPCM, AudioChannels: 2, AudioSampleRate: 4000},
+		{Width: 100, Height: 50, FPS: 24, AudioCodec: AudioCodecPCM, AudioChannels: 2, AudioSampleRate: 200000},
+	}
+
+	for i, cfg := range invalidConfigs {
+		var b bytes.Buffer
+		if err := cfg.Write(&b); !errors.Is(err, ErrInvalidAudioConfig) {
+			t.Errorf("case %d: expected ErrInvalidAudioConfig, got %v", i, err)
+		}
+	}
+}
+
+func TestMultiplexedChunkRoundTrip(t *testing.T) {
+	enc, err := zstd.NewWriter(nil)
+	if err != nil {
+		t.Fatalf("zstd.NewWriter failed: %v", err)
+	}
+	defer enc.Close()
+
+	dec, err := zstd.NewReader(nil)
+	if err != nil {
+		t.Fatalf("zstd.NewReader failed: %v", err)
+	}
+	defer dec.Close()
+
+	origChunk := &Chunk{
+		StartTimestampMs: 0,
+		EndTimestampMs:   100,
+		Frames: []Packet{
+			{TimestampMs: 0, Type: PacketTypeVideoKeyframe, Data: []byte("keyframe-data")},
+			{TimestampMs: 20, Type: PacketTypeAudio, Data: []byte("audio-chunk-1")},
+			{TimestampMs: 40, Type: PacketTypeAudio, Data: []byte("audio-chunk-2")},
+			{TimestampMs: 41, Type: PacketTypeVideoDelta, Data: []byte("delta-frame-1")},
+		},
+	}
+
+	var buf bytes.Buffer
+	if err := WriteChunk(&buf, origChunk, enc); err != nil {
+		t.Fatalf("WriteChunk failed: %v", err)
+	}
+
+	readChunk, err := ReadChunk(&buf, dec)
+	if err != nil {
+		t.Fatalf("ReadChunk failed: %v", err)
+	}
+
+	if len(readChunk.Packets()) != 4 {
+		t.Fatalf("expected 4 packets, got %d", len(readChunk.Packets()))
+	}
+
+	pkts := readChunk.Packets()
+	if !pkts[0].IsKeyframe() || !pkts[0].IsVideo() || pkts[0].IsAudio() {
+		t.Errorf("packet 0 flags incorrect: %+v", pkts[0])
+	}
+	if pkts[1].IsVideo() || !pkts[1].IsAudio() {
+		t.Errorf("packet 1 flags incorrect: %+v", pkts[1])
+	}
+	if pkts[3].IsKeyframe() || !pkts[3].IsVideo() {
+		t.Errorf("packet 3 flags incorrect: %+v", pkts[3])
+	}
+
+	// Oversized audio packet test
+	var oversizedChunk bytes.Buffer
+	oversizedData := make([]byte, MaxAudioPacketBytes+1)
+	var fhdr [FrameHeaderSize]byte
+	binary.BigEndian.PutUint32(fhdr[0:4], 0)
+	fhdr[4] = PacketTypeAudio
+	binary.BigEndian.PutUint32(fhdr[5:9], uint32(len(oversizedData)))
+
+	var rawPayload bytes.Buffer
+	rawPayload.Write(fhdr[:])
+	rawPayload.Write(oversizedData)
+
+	compressed := enc.EncodeAll(rawPayload.Bytes(), nil)
+	var chkHdr [ChunkHeaderSize]byte
+	copy(chkHdr[0:4], MagicChunk[:])
+	binary.BigEndian.PutUint16(chkHdr[12:14], 1)
+	binary.BigEndian.PutUint32(chkHdr[14:18], uint32(rawPayload.Len()))
+	binary.BigEndian.PutUint32(chkHdr[18:22], uint32(len(compressed)))
+	oversizedChunk.Write(chkHdr[:])
+	oversizedChunk.Write(compressed)
+
+	if _, err := ReadChunk(&oversizedChunk, dec); !errors.Is(err, ErrAudioPacketTooLarge) {
+		t.Errorf("expected ErrAudioPacketTooLarge, got %v", err)
+	}
+}
+
+func TestStreamingWriterAndReader(t *testing.T) {
+	var buf bytes.Buffer
+	hdr := Header{
+		Version:         CurrentVersion,
+		ColorMode:       ColorModeTruecolor,
+		Width:           80,
+		Height:          40,
+		FPS:             24,
+		AudioCodec:      AudioCodecOpus,
+		AudioChannels:   2,
+		AudioSampleRate: 48000,
+		Metadata:        "Streaming Test",
+	}
+
+	writer, err := NewWriter(&buf, hdr, 100) // 100ms GOP duration for test
+	if err != nil {
+		t.Fatalf("NewWriter failed: %v", err)
+	}
+
+	// GOP 1: 0ms to 99ms
+	if err := writer.WriteVideoKeyframe(0, []byte("kf0")); err != nil {
+		t.Fatalf("WriteVideoKeyframe failed: %v", err)
+	}
+	if err := writer.WriteAudioPacket(20, []byte("aud0")); err != nil {
+		t.Fatalf("WriteAudioPacket failed: %v", err)
+	}
+	if err := writer.WriteVideoDelta(42, []byte("delta1")); err != nil {
+		t.Fatalf("WriteVideoDelta failed: %v", err)
+	}
+
+	// GOP 2: starts at 100ms
+	if err := writer.WriteVideoKeyframe(100, []byte("kf1")); err != nil {
+		t.Fatalf("WriteVideoKeyframe failed: %v", err)
+	}
+	if err := writer.WriteAudioPacket(120, []byte("aud1")); err != nil {
+		t.Fatalf("WriteAudioPacket failed: %v", err)
+	}
+
+	if err := writer.Close(); err != nil {
+		t.Fatalf("writer.Close failed: %v", err)
+	}
+
+	reader := bytes.NewReader(buf.Bytes())
+	r, err := NewReader(reader)
+	if err != nil {
+		t.Fatalf("NewReader failed: %v", err)
+	}
+	defer r.Close()
+
+	if len(r.Trailer()) != 2 {
+		t.Fatalf("expected 2 trailer chunks, got %d", len(r.Trailer()))
+	}
+
+	// Verify sequential iteration through NextPacket
+	var received []Packet
+	for {
+		pkt, err := r.NextPacket()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("NextPacket failed: %v", err)
+		}
+		received = append(received, *pkt)
+	}
+
+	if len(received) != 5 {
+		t.Fatalf("expected 5 packets total, got %d", len(received))
+	}
+	if string(received[0].Data) != "kf0" || string(received[3].Data) != "kf1" {
+		t.Errorf("unexpected packet content in stream")
+	}
+
+	// Test Seeking to GOP 2
+	if err := r.SeekTo(110); err != nil {
+		t.Fatalf("SeekTo failed: %v", err)
+	}
+	firstAfterSeek, err := r.NextPacket()
+	if err != nil {
+		t.Fatalf("NextPacket after seek failed: %v", err)
+	}
+	if !firstAfterSeek.IsKeyframe() || firstAfterSeek.TimestampMs != 100 {
+		t.Errorf("SeekTo did not land on GOP 2 keyframe: %+v", firstAfterSeek)
+	}
+}
+
+func BenchmarkDemuxerNextPacket(b *testing.B) {
+	var buf bytes.Buffer
+	hdr := Header{
+		Version:         CurrentVersion,
+		ColorMode:       ColorModeTruecolor,
+		Width:           80,
+		Height:          40,
+		FPS:             30,
+		AudioCodec:      AudioCodecPCM,
+		AudioChannels:   2,
+		AudioSampleRate: 48000,
+	}
+
+	writer, _ := NewWriter(&buf, hdr, 1000)
+	frameData := []byte("\033[1;1H\033[38;2;255;255;255m▀")
+	audioData := make([]byte, 256)
+
+	for i := 0; i < 60; i++ {
+		ts := uint32(i * 33)
+		if i%30 == 0 {
+			_ = writer.WriteVideoKeyframe(ts, frameData)
+		} else {
+			_ = writer.WriteVideoDelta(ts, frameData)
+		}
+		_ = writer.WriteAudioPacket(ts, audioData)
+	}
+	_ = writer.Close()
+
+	data := buf.Bytes()
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		r, err := NewReader(bytes.NewReader(data))
+		if err != nil {
+			b.Fatal(err)
+		}
+		for {
+			_, err := r.NextPacket()
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+		_ = r.Close()
+	}
+}
+
+func TestMultiplexedFileLifecycleAndSeek(t *testing.T) {
+	tmpDir := t.TempDir()
+	filePath := filepath.Join(tmpDir, "sample.ttym")
+
+	f, err := os.Create(filePath)
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+
+	hdr := Header{
+		Version:         CurrentVersion,
+		ColorMode:       ColorModeTruecolor,
+		Width:           120,
+		Height:          60,
+		FPS:             30,
+		AudioCodec:      AudioCodecPCM,
+		AudioChannels:   2,
+		AudioSampleRate: 44100,
+		Metadata:        "Disk File Test",
+	}
+
+	w, err := NewWriter(f, hdr, 200) // 200ms chunks
+	if err != nil {
+		t.Fatalf("NewWriter failed: %v", err)
+	}
+
+	// Chunk 1: 0ms..199ms
+	_ = w.WriteVideoKeyframe(0, []byte("chunk0-kf"))
+	_ = w.WriteAudioPacket(50, []byte("chunk0-pcm1"))
+	_ = w.WriteAudioPacket(100, []byte("chunk0-pcm2"))
+	_ = w.WriteVideoDelta(150, []byte("chunk0-delta1"))
+
+	// Chunk 2: 200ms..399ms
+	_ = w.WriteVideoKeyframe(200, []byte("chunk1-kf"))
+	_ = w.WriteAudioPacket(250, []byte("chunk1-pcm1"))
+	_ = w.WriteVideoDelta(300, []byte("chunk1-delta1"))
+
+	if err := w.Close(); err != nil {
+		t.Fatalf("w.Close failed: %v", err)
+	}
+	f.Close()
+
+	// Reopen file with os.Open
+	readFile, err := os.Open(filePath)
+	if err != nil {
+		t.Fatalf("os.Open failed: %v", err)
+	}
+	defer readFile.Close()
+
+	reader, err := NewReader(readFile)
+	if err != nil {
+		t.Fatalf("NewReader failed: %v", err)
+	}
+	defer reader.Close()
+
+	// Verify seekable writer updated header metrics!
+	readHdr := reader.Header()
+	if readHdr.ChunkCount != 2 {
+		t.Errorf("expected ChunkCount 2, got %d", readHdr.ChunkCount)
+	}
+	if readHdr.TotalFrames != 4 {
+		t.Errorf("expected TotalFrames 4 (2 keyframes + 2 deltas), got %d", readHdr.TotalFrames)
+	}
+	if readHdr.DurationMs != 300 {
+		t.Errorf("expected DurationMs 300, got %d", readHdr.DurationMs)
+	}
+
+	// Seek to 250ms (should land on chunk 1 keyframe at 200ms)
+	if err := reader.SeekTo(250); err != nil {
+		t.Fatalf("SeekTo failed: %v", err)
+	}
+	pkt, err := reader.NextPacket()
+	if err != nil {
+		t.Fatalf("NextPacket after seek failed: %v", err)
+	}
+	if !pkt.IsKeyframe() || pkt.TimestampMs != 200 {
+		t.Errorf("expected chunk 1 keyframe at 200ms, got %+v", pkt)
+	}
+}
+
+

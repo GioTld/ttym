@@ -3,6 +3,7 @@ package ttym
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 
@@ -28,14 +29,17 @@ func ReadHeader(r io.Reader) (*Header, error) {
 	}
 
 	h := &Header{
-		Version:     version,
-		ColorMode:   fixed[5],
-		Width:       binary.BigEndian.Uint16(fixed[6:8]),
-		Height:      binary.BigEndian.Uint16(fixed[8:10]),
-		FPS:         binary.BigEndian.Uint16(fixed[10:12]),
-		TotalFrames: binary.BigEndian.Uint32(fixed[12:16]),
-		DurationMs:  binary.BigEndian.Uint32(fixed[16:20]),
-		ChunkCount:  binary.BigEndian.Uint32(fixed[20:24]),
+		Version:         version,
+		ColorMode:       fixed[5],
+		Width:           binary.BigEndian.Uint16(fixed[6:8]),
+		Height:          binary.BigEndian.Uint16(fixed[8:10]),
+		FPS:             binary.BigEndian.Uint16(fixed[10:12]),
+		TotalFrames:     binary.BigEndian.Uint32(fixed[12:16]),
+		DurationMs:      binary.BigEndian.Uint32(fixed[16:20]),
+		ChunkCount:      binary.BigEndian.Uint32(fixed[20:24]),
+		AudioCodec:      fixed[24],
+		AudioChannels:   fixed[25],
+		AudioSampleRate: binary.BigEndian.Uint32(fixed[26:30]),
 	}
 
 	if h.Width == 0 || h.Height == 0 || h.FPS == 0 {
@@ -43,6 +47,15 @@ func ReadHeader(r io.Reader) (*Header, error) {
 	}
 	if h.Width > MaxDimension || h.Height > MaxDimension || h.FPS > MaxFPS {
 		return nil, ErrInvalidDimensions
+	}
+
+	audioCfg := AudioConfig{
+		Codec:      h.AudioCodec,
+		Channels:   h.AudioChannels,
+		SampleRate: h.AudioSampleRate,
+	}
+	if err := audioCfg.Validate(); err != nil {
+		return nil, err
 	}
 
 	metaLen := binary.BigEndian.Uint16(fixed[30:32])
@@ -106,6 +119,11 @@ func ReadChunk(r io.Reader, dec *zstd.Decoder) (*Chunk, error) {
 		ftype := fhdr[4]
 		dataLen := binary.BigEndian.Uint32(fhdr[5:9])
 
+		if ftype == PacketTypeAudio && dataLen > MaxAudioPacketBytes {
+			return nil, fmt.Errorf("%w: audio packet size %d exceeds limit %d",
+				ErrAudioPacketTooLarge, dataLen, MaxAudioPacketBytes)
+		}
+
 		if int64(dataLen) > reader.Size()-int64(reader.Len()) && int64(dataLen) > int64(reader.Len()) {
 			return nil, fmt.Errorf("%w: frame data length %d exceeds remaining chunk buffer", ErrCorruptData, dataLen)
 		}
@@ -157,10 +175,24 @@ func ReadTrailer(r io.ReadSeeker, chunkCount uint32) ([]IndexEntry, error) {
 	}
 
 	indexOffset := binary.BigEndian.Uint64(footer[0:8])
-	expectedIndexSize := uint64(chunkCount) * 12
-	if indexOffset+expectedIndexSize > uint64(fileSize-int64(TrailerFooterSize)) {
-		return nil, fmt.Errorf("%w: index table offset %d + size %d exceeds file boundary",
-			ErrInvalidTrailer, indexOffset, expectedIndexSize)
+	maxIndexBytes := uint64(fileSize - int64(TrailerFooterSize))
+	if indexOffset > maxIndexBytes {
+		return nil, fmt.Errorf("%w: index table offset %d exceeds file boundary %d",
+			ErrInvalidTrailer, indexOffset, maxIndexBytes)
+	}
+
+	availableBytes := maxIndexBytes - indexOffset
+	if availableBytes%12 != 0 {
+		return nil, fmt.Errorf("%w: trailer index size %d is not a multiple of 12",
+			ErrInvalidTrailer, availableBytes)
+	}
+
+	entriesInTrailer := uint32(availableBytes / 12)
+	if chunkCount == 0 {
+		chunkCount = entriesInTrailer
+	} else if chunkCount != entriesInTrailer {
+		return nil, fmt.Errorf("%w: chunk count %d does not match index entries %d",
+			ErrInvalidTrailer, chunkCount, entriesInTrailer)
 	}
 
 	if _, err := r.Seek(int64(indexOffset), io.SeekStart); err != nil {
@@ -181,3 +213,119 @@ func ReadTrailer(r io.ReadSeeker, chunkCount uint32) ([]IndexEntry, error) {
 
 	return entries, nil
 }
+
+// Reader provides high-level sequential demuxing and random seeking across a .ttym file.
+type Reader struct {
+	r            io.ReadSeeker
+	dec          *zstd.Decoder
+	header       *Header
+	trailer      []IndexEntry
+	currentChunk *Chunk
+	packetIdx    int
+	chunkIdx     uint32
+}
+
+// NewReader opens a .ttym bitstream for demuxed reading and reads header & seek index.
+func NewReader(r io.ReadSeeker) (*Reader, error) {
+	hdr, err := ReadHeader(r)
+	if err != nil {
+		return nil, err
+	}
+
+	dec, err := zstd.NewReader(nil)
+	if err != nil {
+		return nil, err
+	}
+
+	trailer, err := ReadTrailer(r, hdr.ChunkCount)
+	if err != nil && !errors.Is(err, ErrInvalidMagic) {
+		dec.Close()
+		return nil, err
+	}
+	if err == nil {
+		hdr.ChunkCount = uint32(len(trailer))
+	}
+
+	firstChunkOffset := int64(FileHeaderFixedSize + len(hdr.Metadata))
+	if len(trailer) > 0 {
+		firstChunkOffset = int64(trailer[0].FileOffset)
+	}
+	if _, err := r.Seek(firstChunkOffset, io.SeekStart); err != nil {
+		dec.Close()
+		return nil, err
+	}
+
+	return &Reader{
+		r:       r,
+		dec:     dec,
+		header:  hdr,
+		trailer: trailer,
+	}, nil
+}
+
+// Header returns the file header metadata.
+func (r *Reader) Header() *Header {
+	return r.header
+}
+
+// Trailer returns the seek table index entries.
+func (r *Reader) Trailer() []IndexEntry {
+	return r.trailer
+}
+
+// NextPacket returns the next interleaved Packet (video or audio) in presentation order.
+// Returns (nil, io.EOF) when all packets in all chunks have been consumed.
+func (r *Reader) NextPacket() (*Packet, error) {
+	for {
+		if r.currentChunk != nil && r.packetIdx < len(r.currentChunk.Frames) {
+			pkt := &r.currentChunk.Frames[r.packetIdx]
+			r.packetIdx++
+			return pkt, nil
+		}
+
+		if r.chunkIdx >= r.header.ChunkCount {
+			return nil, io.EOF
+		}
+
+		chunk, err := ReadChunk(r.r, r.dec)
+		if err != nil {
+			return nil, err
+		}
+
+		r.currentChunk = chunk
+		r.packetIdx = 0
+		r.chunkIdx++
+	}
+}
+
+// SeekTo locates the GOP chunk keyframe containing targetTimestampMs and repositions the stream.
+func (r *Reader) SeekTo(targetTimestampMs uint32) error {
+	if len(r.trailer) == 0 {
+		return errors.New("ttym: cannot seek without trailer index")
+	}
+
+	idx := 0
+	for i := len(r.trailer) - 1; i >= 0; i-- {
+		if r.trailer[i].StartTimestampMs <= targetTimestampMs {
+			idx = i
+			break
+		}
+	}
+
+	targetOffset := r.trailer[idx].FileOffset
+	if _, err := r.r.Seek(int64(targetOffset), io.SeekStart); err != nil {
+		return err
+	}
+
+	r.chunkIdx = uint32(idx)
+	r.currentChunk = nil
+	r.packetIdx = 0
+	return nil
+}
+
+// Close releases decoder resources.
+func (r *Reader) Close() error {
+	r.dec.Close()
+	return nil
+}
+

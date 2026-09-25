@@ -9,6 +9,7 @@
 ## Features
 
 - **Format Specification**: Clean binary format with fixed headers, zstd-compressed GOP chunks, and trailer seek indexes.
+- **Multiplexed Audio Tracks**: Interleaved audio packets (Raw PCM s16le, Opus, ADPCM) synchronized within GOP chunks with zero container overhead.
 - **Subpixel Block Rendering**:
   - **Half-Blocks (1×2)**: Canonical upper half-block (`▀`) sampling.
   - **Quarter-Blocks (2×2)**: 16 Unicode quadrant glyphs with 2-color k-means clustering for double horizontal resolution.
@@ -45,7 +46,7 @@ ttym inspect movie.ttym
 ```
 
 Outputs:
-- Resolution, framerate, duration, and color mode
+- Resolution, framerate, duration, color mode, and audio track parameters
 - GOP chunk counts and uncompressed/compressed ratios
 - Trailer seek index table
 
@@ -55,37 +56,48 @@ Outputs:
 ttym validate movie.ttym
 ```
 
-Performs full frame-by-frame integrity and decompression checks.
+Performs full frame-by-frame and packet-by-packet integrity and decompression checks.
 
 ---
 
 ## Usage in Go
 
-### Reading and Streaming
+### Streaming Demuxer & Iteration
 
 ```go
 package main
 
 import (
+	"errors"
+	"io"
 	"os"
 
 	"github.com/GioTld/ttym"
-	"github.com/klauspost/compress/zstd"
 )
 
 func main() {
 	f, _ := os.Open("movie.ttym")
 	defer f.Close()
 
-	hdr, _ := ttym.ReadHeader(f)
-	dec, _ := zstd.NewReader(nil)
-	defer dec.Close()
+	reader, err := ttym.NewReader(f)
+	if err != nil {
+		panic(err)
+	}
+	defer reader.Close()
 
-	for i := uint32(0); i < hdr.ChunkCount; i++ {
-		chunk, _ := ttym.ReadChunk(f, dec)
-		for _, frame := range chunk.Frames {
-			// frame.Data contains ready-to-write ANSI sequences
-			os.Stdout.Write(frame.Data)
+	for {
+		packet, err := reader.NextPacket()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			panic(err)
+		}
+
+		if packet.IsVideo() {
+			os.Stdout.Write(packet.Data)
+		} else if packet.IsAudio() {
+			// dispatch audio packet (PCM, Opus, ADPCM) to sound driver
 		}
 	}
 }

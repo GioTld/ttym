@@ -87,6 +87,15 @@ func handleInspect(args []string) {
 	if hdr.Metadata != "" {
 		fmt.Printf("  • Title / Meta: %s\n", hdr.Metadata)
 	}
+	if hdr.AudioCodec != ttym.AudioCodecNone {
+		audioCfg := ttym.AudioConfig{
+			Codec:      hdr.AudioCodec,
+			Channels:   hdr.AudioChannels,
+			SampleRate: hdr.AudioSampleRate,
+		}
+		fmt.Printf("  • Audio Track:  %s, %d ch, %d Hz\n",
+			audioCfg.CodecName(), hdr.AudioChannels, hdr.AudioSampleRate)
+	}
 
 	if hdr.ChunkCount > 0 {
 		entries, err := ttym.ReadTrailer(f, hdr.ChunkCount)
@@ -136,7 +145,8 @@ func handleValidate(args []string) {
 	}
 	defer dec.Close()
 
-	frameCount := 0
+	videoCount := 0
+	audioCount := 0
 	for i := uint32(0); i < hdr.ChunkCount; i++ {
 		chunk, err := ttym.ReadChunk(f, dec)
 		if err != nil {
@@ -144,14 +154,20 @@ func handleValidate(args []string) {
 			os.Exit(1)
 		}
 		if len(chunk.Frames) == 0 {
-			fmt.Fprintf(os.Stderr, "validation failed: chunk %d has zero frames\n", i)
+			fmt.Fprintf(os.Stderr, "validation failed: chunk %d has zero packets\n", i)
 			os.Exit(1)
 		}
-		if chunk.Frames[0].Type != ttym.FrameTypeKeyframe {
-			fmt.Fprintf(os.Stderr, "validation failed: chunk %d first frame is not a Keyframe\n", i)
+		if !chunk.Frames[0].IsKeyframe() {
+			fmt.Fprintf(os.Stderr, "validation failed: chunk %d first packet is not a Keyframe\n", i)
 			os.Exit(1)
 		}
-		frameCount += len(chunk.Frames)
+		for _, p := range chunk.Frames {
+			if p.IsVideo() {
+				videoCount++
+			} else if p.IsAudio() {
+				audioCount++
+			}
+		}
 	}
 
 	entries, err := ttym.ReadTrailer(f, hdr.ChunkCount)
@@ -160,5 +176,6 @@ func handleValidate(args []string) {
 		os.Exit(1)
 	}
 
-	fmt.Printf("✓ File %s is valid: %d chunks, %d frames verified.\n", path, len(entries), frameCount)
+	fmt.Printf("✓ File %s is valid: %d chunks, %d video frames, %d audio packets verified.\n",
+		path, len(entries), videoCount, audioCount)
 }
