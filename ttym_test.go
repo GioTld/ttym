@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -866,6 +867,141 @@ func BenchmarkMotionDeltaDecoder(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		_, _ = dec.Decode(pkt)
+	}
+}
+
+func TestSIMDParity(t *testing.T) {
+	// 1. Test rgbDistBatch4 against rgbDistBatch4Scalar
+	for iter := 0; iter < 100; iter++ {
+		px := [4]RGB{
+			{uint8(iter * 3), uint8(iter * 7), uint8(iter * 11)},
+			{uint8(255 - iter), uint8(iter * 5), uint8(128)},
+			{uint8(iter * 2), uint8(200 - iter), uint8(50 + iter)},
+			{uint8(99), uint8(iter * 9), uint8(iter * 4)},
+		}
+		c0 := RGB{uint8(iter), uint8(iter * 2), uint8(iter * 3)}
+		c1 := RGB{uint8(255 - iter*2), uint8(100), uint8(iter * 4)}
+
+		d0Fast, d1Fast := rgbDistBatch4(&px, c0, c1)
+		d0Scalar, d1Scalar := rgbDistBatch4Scalar(&px, c0, c1)
+
+		if d0Fast != d0Scalar {
+			t.Fatalf("iter %d: d0 mismatch: fast %v vs scalar %v", iter, d0Fast, d0Scalar)
+		}
+		if d1Fast != d1Scalar {
+			t.Fatalf("iter %d: d1 mismatch: fast %v vs scalar %v", iter, d1Fast, d1Scalar)
+		}
+	}
+
+	// 2. Test clampDitherRGBFast against clampDitherRGBScalar
+	for r := 0; r < 256; r += 17 {
+		for g := 0; g < 256; g += 19 {
+			for b := 0; b < 256; b += 23 {
+				for _, offset := range []int16{-50, -19, -5, 0, 5, 19, 50, 300, -300} {
+					fr, fg, fb := clampDitherRGBFast(uint8(r), uint8(g), uint8(b), offset)
+					sr, sg, sb := clampDitherRGBScalar(uint8(r), uint8(g), uint8(b), offset)
+					if fr != sr || fg != sg || fb != sb {
+						t.Fatalf("clamp mismatch for (%d,%d,%d)+%d: fast=(%d,%d,%d) vs scalar=(%d,%d,%d)",
+							r, g, b, offset, fr, fg, fb, sr, sg, sb)
+					}
+				}
+			}
+		}
+	}
+
+	// 3. Test batchOklabDistancesFast against batchOklabDistancesScalar
+	targetL, targetA, targetB := 0.65, 0.12, -0.08
+	palL := make([]float64, 216)
+	palA := make([]float64, 216)
+	palB := make([]float64, 216)
+	for i := 0; i < 216; i++ {
+		palL[i] = float64(i) / 216.0
+		palA[i] = float64(i%6-3) / 10.0
+		palB[i] = float64(i%36-18) / 20.0
+	}
+	outFast := make([]float64, 216)
+	outScalar := make([]float64, 216)
+	batchOklabDistancesFast(targetL, targetA, targetB, palL, palA, palB, outFast)
+	batchOklabDistancesScalar(targetL, targetA, targetB, palL, palA, palB, outScalar)
+	for i := 0; i < 216; i++ {
+		if math.Abs(outFast[i]-outScalar[i]) > 1e-9 {
+			t.Fatalf("oklab dist mismatch at %d: fast %f vs scalar %f", i, outFast[i], outScalar[i])
+		}
+	}
+}
+
+func BenchmarkRenderKeyframe(b *testing.B) {
+	width, height := 80, 40
+	totalCells := width * height
+	cells := make([]CellState, totalCells)
+	for i := 0; i < totalCells; i++ {
+		cells[i] = CellState{FG: RGB{uint8(i % 256), 120, 80}, BG: RGB{10, 20, 30}, Char: GlyphHalfBlock}
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = RenderKeyframe(cells, width, height)
+	}
+}
+
+func BenchmarkRenderDelta(b *testing.B) {
+	width, height := 80, 40
+	totalCells := width * height
+	f0 := make([]CellState, totalCells)
+	f1 := make([]CellState, totalCells)
+	for i := 0; i < totalCells; i++ {
+		f0[i] = CellState{FG: RGB{uint8(i % 256), 100, 50}, BG: RGB{0, 0, 0}, Char: GlyphHalfBlock}
+		if i%10 == 0 {
+			f1[i] = CellState{FG: RGB{255, 255, 255}, BG: RGB{0, 0, 0}, Char: GlyphHalfBlock}
+		} else {
+			f1[i] = f0[i]
+		}
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, _ = RenderDelta(f1, f0, width, height, 0)
+	}
+}
+
+func BenchmarkCellFromQuarter(b *testing.B) {
+	tl := RGB{250, 10, 20}
+	tr := RGB{240, 20, 30}
+	bl := RGB{10, 20, 200}
+	br := RGB{20, 30, 210}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = CellFromQuarter(tl, tr, bl, br)
+	}
+}
+
+func BenchmarkQuantizeRGBWithCoord(b *testing.B) {
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = QuantizeRGBWithCoord(uint8(i%256), uint8((i*3)%256), uint8((i*7)%256), i%80, (i/80)%40, Palette216, true)
+	}
+}
+
+func BenchmarkBatchOklabDistances(b *testing.B) {
+	palL := make([]float64, 216)
+	palA := make([]float64, 216)
+	palB := make([]float64, 216)
+	for i := 0; i < 216; i++ {
+		palL[i] = float64(i) / 216.0
+		palA[i] = float64(i%6-3) / 10.0
+		palB[i] = float64(i%36-18) / 20.0
+	}
+	out := make([]float64, 216)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		BatchOklabDistances(0.65, 0.12, -0.08, palL, palA, palB, out)
 	}
 }
 

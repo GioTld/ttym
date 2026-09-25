@@ -29,6 +29,8 @@ var (
 		{3.0 / 16.0, 11.0 / 16.0, 1.0 / 16.0, 9.0 / 16.0},
 		{15.0 / 16.0, 7.0 / 16.0, 13.0 / 16.0, 5.0 / 16.0},
 	}
+
+	bayerOffsets216 [4][4]int16
 )
 
 func srgbToLinear(c uint8) float64 {
@@ -59,6 +61,12 @@ func rgbToOklab(r, g, b uint8) (L, a, ob float64) {
 }
 
 func init() {
+	for y := 0; y < 4; y++ {
+		for x := 0; x < 4; x++ {
+			bayerOffsets216[y][x] = int16(math.Round((bayer4x4[y][x] - 0.5) * 51.0 * 0.75))
+		}
+	}
+
 	// 64 colors: 4 levels {0, 85, 170, 255}
 	for i := 0; i < 256; i++ {
 		quantLUT64[i] = uint8(math.Round(float64(i)/85.0) * 85.0)
@@ -154,20 +162,7 @@ func quantizeChannel(val uint8, px, py int, palette int, dither bool) uint8 {
 func QuantizeRGBWithCoord(r, g, b uint8, px, py int, palette int, dither bool) RGB {
 	if palette == Palette216 {
 		if dither {
-			bayerVal := bayer4x4[py&3][px&3]
-			offset := (bayerVal - 0.5) * 51.0 * 0.75
-			clamp := func(v float64) uint8 {
-				if v < 0 {
-					return 0
-				}
-				if v > 255 {
-					return 255
-				}
-				return uint8(v)
-			}
-			r = clamp(float64(r) + offset)
-			g = clamp(float64(g) + offset)
-			b = clamp(float64(b) + offset)
+			r, g, b = clampDitherRGBFast(r, g, b, bayerOffsets216[py&3][px&3])
 		}
 		return oklabQuantLUT[r>>3][g>>3][b>>3]
 	}
@@ -184,4 +179,10 @@ func rgbDist(a, b RGB) int {
 	dg := int(a.G) - int(b.G)
 	db := int(a.B) - int(b.B)
 	return dr*dr + dg*dg + db*db
+}
+
+// BatchOklabDistances computes squared Euclidean distance in Oklab perceptual color space
+// between a target color and an array of palette colors.
+func BatchOklabDistances(targetL, targetA, targetB float64, paletteL, paletteA, paletteB []float64, outDists []float64) {
+	batchOklabDistancesFast(targetL, targetA, targetB, paletteL, paletteA, paletteB, outDists)
 }

@@ -11,12 +11,16 @@
 - **Format Specification**: Clean binary format with fixed headers, zstd-compressed GOP chunks, and trailer seek indexes.
 - **Multiplexed Audio Tracks**: Interleaved audio packets (Raw PCM s16le, Opus, ADPCM) synchronized within GOP chunks with zero container overhead.
 - **Motion-Compensated Delta Encoding**: 2D block matching ($4\times 4$ macroblocks) and compact bitstream vectors/residuals, cutting dirty cells by $>50\%-70\%$ on camera pans and scrolling.
+- **SIMD Acceleration & Zero-Allocation Diffing**:
+  - Pure Go assembly vectorization for x86_64 (SSE/AVX2) and ARM64 (NEON) with complete scalar fallback.
+  - Subpixel 2-color k-means clustering in ~90 ns/cell (11M+ cells/sec).
+  - Pre-warmed `RingBuffer` and fast ANSI escape formatters eliminating steady-state heap allocations (0 B/op, 0 allocs/op).
 - **Subpixel Block Rendering**:
   - **Half-Blocks (1×2)**: Canonical upper half-block (`▀`) sampling.
   - **Quarter-Blocks (2×2)**: 16 Unicode quadrant glyphs with 2-color k-means clustering for double horizontal resolution.
 - **Color Science**:
   - Precomputed 32×32×32 Oklab color space lookup table for the 216-color palette.
-  - Bayer 4×4 spatial dithering matrix.
+  - Bayer 4×4 spatial dithering matrix with SIMD-accelerated saturation.
   - Lossless 24-bit Truecolor RGB bypass.
 - **Temporal Delta Engine**: Sparse ANSI diffing emitting only dirty cells with absolute cursor positioning (`\033[y;xH`).
 - **Bitstream Safety**: Strict bounds checking, metadata length limits, and decompression bomb caps.

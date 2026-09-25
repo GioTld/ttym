@@ -12,6 +12,7 @@ type Decoder struct {
 	canvas        []CellState
 	prevCanvas    []CellState
 	scratchCanvas []CellState
+	renderBuf     []byte
 }
 
 // NewDecoder initializes a stateful Decoder with pre-allocated steady-state canvas buffers.
@@ -23,6 +24,7 @@ func NewDecoder(width, height int) *Decoder {
 		canvas:        make([]CellState, totalCells),
 		prevCanvas:    make([]CellState, totalCells),
 		scratchCanvas: make([]CellState, totalCells),
+		renderBuf:     make([]byte, 0, totalCells*32),
 	}
 }
 
@@ -111,7 +113,7 @@ func (d *Decoder) Decode(pkt *Packet) ([]byte, error) {
 			if err := d.ApplyKeyframe(cells); err != nil {
 				return nil, err
 			}
-			return RenderKeyframe(d.canvas, d.width, d.height), nil
+			return AppendRenderKeyframe(d.renderBuf[:0], d.canvas, d.width, d.height), nil
 		}
 		// Raw ANSI keyframe pass-through
 		return pkt.Data, nil
@@ -122,7 +124,7 @@ func (d *Decoder) Decode(pkt *Packet) ([]byte, error) {
 		if err := d.ApplyMotionDelta(pkt.Data); err != nil {
 			return nil, err
 		}
-		ansi, _ := RenderDelta(d.canvas, d.scratchCanvas, d.width, d.height, 0)
+		ansi, _ := AppendRenderDelta(d.renderBuf[:0], d.canvas, d.scratchCanvas, d.width, d.height, 0)
 		return ansi, nil
 	}
 

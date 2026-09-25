@@ -19,26 +19,35 @@ var quarterChars = [16]string{
 	"▘", "▚", "▌", "▙", "▀", "▜", "▛", "█",
 }
 
+var quarterGlyphs = [16][]byte{
+	[]byte(" "), []byte("▗"), []byte("▖"), []byte("▄"),
+	[]byte("▝"), []byte("▐"), []byte("▞"), []byte("▟"),
+	[]byte("▘"), []byte("▚"), []byte("▌"), []byte("▙"),
+	[]byte("▀"), []byte("▜"), []byte("▛"), []byte("█"),
+}
+
 // CellFromQuarter builds a CellState for a 2×2 subpixel group using 2-color k-means.
 func CellFromQuarter(tl, tr, bl, br RGB) CellState {
 	px := [4]RGB{tl, tr, bl, br}
 
 	// k-means with k=2: initialize centroids as the two most distant pixels.
 	c0, c1 := px[0], px[0]
-	maxDist := 0
-	for _, p := range px[1:] {
-		if d := rgbDist(px[0], p); d > maxDist {
-			maxDist = d
-			c1 = p
+	d0, _ := rgbDistBatch4(&px, px[0], px[0])
+	maxDist := int32(0)
+	for i := 1; i < 4; i++ {
+		if d0[i] > maxDist {
+			maxDist = d0[i]
+			c1 = px[i]
 		}
 	}
 
 	var assign [4]int
 	for iter := 0; iter < 3; iter++ {
+		d0, d1 := rgbDistBatch4(&px, c0, c1)
 		var sum0, sum1 [3]int
 		var cnt0, cnt1 int
 		for i, p := range px {
-			if rgbDist(p, c0) <= rgbDist(p, c1) {
+			if d0[i] <= d1[i] {
 				assign[i] = 0
 				sum0[0] += int(p.R)
 				sum0[1] += int(p.G)
@@ -62,7 +71,7 @@ func CellFromQuarter(tl, tr, bl, br RGB) CellState {
 
 	// Build 4-bit pattern: TL=bit3, TR=bit2, BL=bit1, BR=bit0.
 	pattern := assign[0]<<3 | assign[1]<<2 | assign[2]<<1 | assign[3]
-	return CellState{FG: c1, BG: c0, Char: []byte(quarterChars[pattern])}
+	return CellState{FG: c1, BG: c0, Char: quarterGlyphs[pattern]}
 }
 
 // ExtractCells processes a raw RGB24 frame into a grid of CellState.
