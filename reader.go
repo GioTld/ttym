@@ -217,9 +217,10 @@ func ReadTrailer(r io.ReadSeeker, chunkCount uint32) ([]IndexEntry, error) {
 	return entries, nil
 }
 
-// Reader provides high-level sequential demuxing and random seeking across a .ttym file.
+// Reader provides high-level sequential demuxing and random seeking across a .ttym file or stream.
 type Reader struct {
-	r            io.ReadSeeker
+	r            io.Reader
+	rs           io.ReadSeeker
 	dec          *zstd.Decoder
 	header       *Header
 	trailer      []IndexEntry
@@ -228,8 +229,9 @@ type Reader struct {
 	chunkIdx     uint32
 }
 
-// NewReader opens a .ttym bitstream for demuxed reading and reads header & seek index.
-func NewReader(r io.ReadSeeker) (*Reader, error) {
+// NewReader opens a .ttym bitstream for demuxed reading.
+// If r implements io.ReadSeeker, it also parses the trailer index for random seeking.
+func NewReader(r io.Reader) (*Reader, error) {
 	hdr, err := ReadHeader(r)
 	if err != nil {
 		return nil, err
@@ -240,26 +242,28 @@ func NewReader(r io.ReadSeeker) (*Reader, error) {
 		return nil, err
 	}
 
-	trailer, err := ReadTrailer(r, hdr.ChunkCount)
-	if err != nil && !errors.Is(err, ErrInvalidMagic) {
-		dec.Close()
-		return nil, err
-	}
-	if err == nil {
-		hdr.ChunkCount = uint32(len(trailer))
-	}
-
-	firstChunkOffset := int64(FileHeaderFixedSize + len(hdr.Metadata))
-	if len(trailer) > 0 {
-		firstChunkOffset = int64(trailer[0].FileOffset)
-	}
-	if _, err := r.Seek(firstChunkOffset, io.SeekStart); err != nil {
-		dec.Close()
-		return nil, err
+	var rs io.ReadSeeker
+	var trailer []IndexEntry
+	if s, ok := r.(io.ReadSeeker); ok {
+		rs = s
+		t, err := ReadTrailer(rs, hdr.ChunkCount)
+		if err == nil {
+			trailer = t
+			hdr.ChunkCount = uint32(len(trailer))
+		}
+		firstChunkOffset := int64(FileHeaderFixedSize + len(hdr.Metadata))
+		if len(trailer) > 0 {
+			firstChunkOffset = int64(trailer[0].FileOffset)
+		}
+		if _, err := rs.Seek(firstChunkOffset, io.SeekStart); err != nil {
+			dec.Close()
+			return nil, err
+		}
 	}
 
 	return &Reader{
 		r:       r,
+		rs:      rs,
 		dec:     dec,
 		header:  hdr,
 		trailer: trailer,
@@ -303,8 +307,8 @@ func (r *Reader) NextPacket() (*Packet, error) {
 
 // SeekTo locates the GOP chunk keyframe containing targetTimestampMs and repositions the stream.
 func (r *Reader) SeekTo(targetTimestampMs uint32) error {
-	if len(r.trailer) == 0 {
-		return errors.New("ttym: cannot seek without trailer index")
+	if r.rs == nil || len(r.trailer) == 0 {
+		return errors.New("ttym: cannot seek without seekable stream and trailer index")
 	}
 
 	idx := 0
@@ -316,7 +320,7 @@ func (r *Reader) SeekTo(targetTimestampMs uint32) error {
 	}
 
 	targetOffset := r.trailer[idx].FileOffset
-	if _, err := r.r.Seek(int64(targetOffset), io.SeekStart); err != nil {
+	if _, err := r.rs.Seek(int64(targetOffset), io.SeekStart); err != nil {
 		return err
 	}
 
