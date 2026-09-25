@@ -1,0 +1,5 @@
+module github.com/GioTld/ttym
+
+go 1.27.1
+
+require github.com/klauspost/compress v1.20.1

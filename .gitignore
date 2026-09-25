@@ -1,0 +1,17 @@
+# Binaries
+bin/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test artifacts and coverage
+*.out
+*.test
+coverage.txt
+
+# OS and Editor files
+.DS_Store
+.vscode/
+.idea/
+*.swp
